@@ -28,6 +28,23 @@ jobs:
           flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
           flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
+      - name: "Check if secrets are loaded"
+        run: |
+          if [ -z "${{ secrets.DROPLET_IP }}" ]; then
+            echo "DROPLET_IP secret is NOT set!"
+          else
+            echo "DROPLET_IP secret is set."
+          fi
+          if [ -z "${{ secrets.SSH_PRIVATE_KEY }}" ]; then
+            echo "SSH_PRIVATE_KEY secret is NOT set!"
+          else
+            echo "SSH_PRIVATE_KEY secret is set."
+          fi
+          if [ -z "${{ secrets.SSH_PASSPHRASE }}" ]; then
+            echo "SSH_PASSPHRASE secret is NOT set (this is ok if your key has no passphrase)."
+          else
+            echo "SSH_PASSPHRASE secret is set."
+          fi
       - name: Deploy to server
         uses: appleboy/ssh-action@master
         with:
