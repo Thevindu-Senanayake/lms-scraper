@@ -184,45 +184,6 @@ class DiscordLogHandler(logging.Handler):
         except Exception:
             self.handleError(record)
 
-@bot.tree.command(name="get_log_level", description="Show the current Discord log-forwarding level")
-async def get_log_level(interaction: discord.Interaction):
-    try:
-        guild_id = interaction.guild.id if interaction.guild else 'DM'
-        logging.info(f"/get_log_level requested by {interaction.user} (id={interaction.user.id}) in guild={guild_id}")
-    except Exception:
-        pass
-    if not user_is_authorized(interaction.user, interaction.guild):
-        await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
-        return
-    level = DISCORD_LOG_LEVEL
-    await interaction.response.send_message(f"Discord log-forwarding level: {level}", ephemeral=True)
-
-@bot.tree.command(name="set_log_level", description="Set the Discord log-forwarding level (DEBUG/INFO/WARNING/ERROR/CRITICAL)")
-@app_commands.describe(level="One of: DEBUG, INFO, WARNING, ERROR, CRITICAL")
-async def set_log_level(interaction: discord.Interaction, level: str):
-    try:
-        guild_id = interaction.guild.id if interaction.guild else 'DM'
-        logging.info(f"/set_log_level requested by {interaction.user} (id={interaction.user.id}) in guild={guild_id} level={level}")
-    except Exception:
-        pass
-    if not user_is_authorized(interaction.user, interaction.guild):
-        await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
-        return
-    l = level.strip().upper()
-    if l not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
-        await interaction.response.send_message("Invalid level. Use DEBUG, INFO, WARNING, ERROR, or CRITICAL.", ephemeral=True)
-        return
-    try:
-        global DISCORD_LOG_LEVEL, DISCORD_LOG_HANDLER
-        DISCORD_LOG_LEVEL = l
-        if DISCORD_LOG_HANDLER is not None:
-            DISCORD_LOG_HANDLER.setLevel(getattr(logging, l))
-        await interaction.response.send_message(f"Discord log-forwarding level set to {l}", ephemeral=True)
-        logging.info(f"Discord log-forwarding level changed to {l} by user id={interaction.user.id}")
-    except Exception:
-        logging.exception("Failed to set log level via /set_log_level")
-        await interaction.response.send_message("Failed to set log level. See logs.", ephemeral=True)
-
     async def _sender(self):
         """Background coroutine running on bot loop that sends queued logs to the channel."""
         # resolve the channel id
@@ -285,6 +246,46 @@ async def set_log_level(interaction: discord.Interaction, level: str):
             except Exception:
                 logging.exception("Unexpected error in DiscordLogHandler sender loop")
                 await asyncio.sleep(5)
+
+
+@bot.tree.command(name="get_log_level", description="Show the current Discord log-forwarding level")
+async def get_log_level(interaction: discord.Interaction):
+    try:
+        guild_id = interaction.guild.id if interaction.guild else 'DM'
+        logging.info(f"/get_log_level requested by {interaction.user} (id={interaction.user.id}) in guild={guild_id}")
+    except Exception:
+        pass
+    if not user_is_authorized(interaction.user, interaction.guild):
+        await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
+        return
+    level = DISCORD_LOG_LEVEL
+    await interaction.response.send_message(f"Discord log-forwarding level: {level}", ephemeral=True)
+
+@bot.tree.command(name="set_log_level", description="Set the Discord log-forwarding level (DEBUG/INFO/WARNING/ERROR/CRITICAL)")
+@app_commands.describe(level="One of: DEBUG, INFO, WARNING, ERROR, CRITICAL")
+async def set_log_level(interaction: discord.Interaction, level: str):
+    try:
+        guild_id = interaction.guild.id if interaction.guild else 'DM'
+        logging.info(f"/set_log_level requested by {interaction.user} (id={interaction.user.id}) in guild={guild_id} level={level}")
+    except Exception:
+        pass
+    if not user_is_authorized(interaction.user, interaction.guild):
+        await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
+        return
+    l = level.strip().upper()
+    if l not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        await interaction.response.send_message("Invalid level. Use DEBUG, INFO, WARNING, ERROR, or CRITICAL.", ephemeral=True)
+        return
+    try:
+        global DISCORD_LOG_LEVEL
+        DISCORD_LOG_LEVEL = l
+        if DISCORD_LOG_HANDLER is not None:
+            DISCORD_LOG_HANDLER.setLevel(getattr(logging, l))
+        await interaction.response.send_message(f"Discord log-forwarding level set to {l}", ephemeral=True)
+        logging.info(f"Discord log-forwarding level changed to {l} by user id={interaction.user.id}")
+    except Exception:
+        logging.exception("Failed to set log level via /set_log_level")
+        await interaction.response.send_message("Failed to set log level. See logs.", ephemeral=True)
 
 
 def setup_discord_log_handler():
