@@ -27,7 +27,7 @@ logging.basicConfig(
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Try to load initial course list; if missing, continue and let admin commands populate it
+# Try to load initial course list
 try:
     with open("course_urls.json", "r", encoding="utf-8") as f:
         COURSE_URLS = json.load(f)
@@ -38,14 +38,15 @@ except FileNotFoundError:
 
 load_dotenv()
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-# Channel ID where notifications should be posted by the bot (string or int)
 DISCORD_NOTIFY_CHANNEL_ID = os.getenv("DISCORD_NOTIFY_CHANNEL_ID")
-# Role name allowed to manage courses (exact match)
+DISCORD_LOG_CHANNEL_ID = os.getenv("DISCORD_LOG_CHANNEL_ID")
+# Log level for Discord channel (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+DISCORD_LOG_LEVEL = os.getenv("DISCORD_LOG_LEVEL", "WARNING").upper()
+DISCORD_LOG_HANDLER = None
 ADMIN_ROLE_NAME = os.getenv("DISCORD_ADMIN_ROLE", "course-admin")
-# Whitelisted Discord user IDs as comma-separated env var (e.g. "123,456")
 WHITELISTED_IDS = set([s.strip() for s in os.getenv("DISCORD_WHITELISTED_IDS", "").split(",") if s.strip()])
 
-# Load cookies safely; allow admins to set them via bot if missing
+# Load cookies
 try:
     with open('cookies.json', 'r', encoding='utf-8') as f:
         session_data = json.load(f)
@@ -69,45 +70,11 @@ def read_cookies():
             return {}
 
 
-def validate_cookie(test_url: str | None = None, timeout: int = 10):
-    """Quick validation of the MoodleSession cookie.
-
-    If test_url is provided, we'll perform a GET to it using the cookie and
-    consider the cookie valid if we get a 200 and the response doesn't look
-    like a login/redirect page. If no test_url is provided, we attempt to use
-    the first course URL from `course_urls.json` as a test; else we return False.
-    """
-    try:
-        cookies = read_cookies()
-        if not cookies:
-            return False
-
-        if not test_url:
-            urls = read_course_urls()
-            test_url = urls[0] if urls else None
-        if not test_url:
-            # No reasonable test available; caller should decide how to proceed.
-            return None
-
-        resp = requests.get(test_url, cookies=cookies, headers=headers, timeout=timeout, allow_redirects=True, verify=False)
-        # If the site redirected to a login page or returned 200 with login markers, treat as invalid
-        if resp.status_code != 200:
-            return False
-        text = resp.text.lower()
-        # Heuristics: presence of 'login' or 'username' or 'password' suggests cookie not valid
-        if 'login' in text or 'username' in text or 'password' in text or 'moodle' not in text:
-            return False
-        return True
-    except Exception:
-        logging.exception("Error while validating cookie")
-        return False
-
-
 def is_cookie_full_shape(obj) -> bool:
     """Return True if obj looks like a full exported cookie object.
 
     We require at minimum: 'name', 'value', and 'domain' keys. The 'name'
-    should equal 'MoodleSession' (case-sensitive) to be considered valid.
+    should equal 'MoodleSession' to be considered valid.
     """
     if not isinstance(obj, dict):
         return False
@@ -121,32 +88,26 @@ def is_cookie_full_shape(obj) -> bool:
 def write_cookies(value: str):
     """Thread-safe write of cookies.json.
 
-    The cookie must be provided as a full JSON object (either a dict or a JSON-object string).
+    The cookie must be provided as a full JSON object (JSON-object string).
     This function will overwrite `cookies.json` with that object.
     If the input is not a JSON object, a ValueError is raised.
     """
     with file_lock:
         try:
-            if isinstance(value, dict):
-                with open('cookies.json', 'w', encoding='utf-8') as f:
-                    json.dump(value, f, indent=2, ensure_ascii=False)
-                return
+            if not isinstance(value, str):
+                raise ValueError("Cookie must be provided as a full JSON object (JSON-object string)")
 
-            # If it's a string, it must be a JSON object string
-            if isinstance(value, str):
-                s = value.strip()
-                if s.startswith('{') and s.endswith('}'):
-                    try:
-                        parsed = json.loads(s)
-                        if isinstance(parsed, dict):
-                            with open('cookies.json', 'w', encoding='utf-8') as f:
-                                json.dump(parsed, f, indent=2, ensure_ascii=False)
-                            return
-                    except json.JSONDecodeError:
-                        raise ValueError("Provided cookie string is not valid JSON")
-
-            # If we reach here, the input was not an acceptable JSON object
-            raise ValueError("Cookie must be provided as a full JSON object (dict or JSON-object string)")
+            # parse the JSON string
+            s = value.strip()
+            if s.startswith('{') and s.endswith('}'):
+                try:
+                    parsed = json.loads(s)
+                    if isinstance(parsed, dict):
+                        with open('cookies.json', 'w', encoding='utf-8') as f:
+                            json.dump(parsed, f, indent=2, ensure_ascii=False)
+                        return
+                except json.JSONDecodeError:
+                    raise ValueError("Provided cookie string is not valid JSON")
         except Exception:
             logging.exception("Failed to write cookies.json")
             # Re-raise so callers can react to validation/write failures
@@ -184,11 +145,163 @@ def write_course_urls(urls):
             json.dump(urls, f, indent=2, ensure_ascii=False)
 
 
-# --- Discord bot for admin commands -------------------------------------------------
 intents = discord.Intents.default()
 # We need members intent to check roles on users
 intents.members = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix=[], intents=intents)
+
+
+class DiscordLogHandler(logging.Handler):
+    """Logging handler that posts log records to a Discord channel asynchronously.
+
+    It enqueues formatted log messages and a background coroutine on the bot loop will
+    pull from the queue and send them to the configured channel. This avoids blocking
+    the main thread or bot event loop directly from the logging call site.
+    """
+    def __init__(self, bot, level=logging.WARNING):
+        super().__init__(level=level)
+        self.bot = bot
+        self.queue = asyncio.Queue()
+        self._task = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            # Enqueue without blocking
+            try:
+                self.queue.put_nowait((record.levelno, msg))
+            except Exception:
+                # If queue put fails for any reason, fallback to console
+                print(msg)
+            # Ensure background sender is scheduled when bot loop is available
+            if self._task is None and self.bot and getattr(self.bot, 'loop', None):
+                try:
+                    # schedule the background sender on the bot loop
+                    self._task = asyncio.run_coroutine_threadsafe(self._sender(), self.bot.loop)
+                except Exception:
+                    # If the loop isn't running yet, ignore — sender will be started from on_ready
+                    pass
+        except Exception:
+            self.handleError(record)
+
+@bot.tree.command(name="get_log_level", description="Show the current Discord log-forwarding level")
+async def get_log_level(interaction: discord.Interaction):
+    try:
+        guild_id = interaction.guild.id if interaction.guild else 'DM'
+        logging.info(f"/get_log_level requested by {interaction.user} (id={interaction.user.id}) in guild={guild_id}")
+    except Exception:
+        pass
+    if not user_is_authorized(interaction.user, interaction.guild):
+        await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
+        return
+    level = DISCORD_LOG_LEVEL
+    await interaction.response.send_message(f"Discord log-forwarding level: {level}", ephemeral=True)
+
+@bot.tree.command(name="set_log_level", description="Set the Discord log-forwarding level (DEBUG/INFO/WARNING/ERROR/CRITICAL)")
+@app_commands.describe(level="One of: DEBUG, INFO, WARNING, ERROR, CRITICAL")
+async def set_log_level(interaction: discord.Interaction, level: str):
+    try:
+        guild_id = interaction.guild.id if interaction.guild else 'DM'
+        logging.info(f"/set_log_level requested by {interaction.user} (id={interaction.user.id}) in guild={guild_id} level={level}")
+    except Exception:
+        pass
+    if not user_is_authorized(interaction.user, interaction.guild):
+        await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
+        return
+    l = level.strip().upper()
+    if l not in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+        await interaction.response.send_message("Invalid level. Use DEBUG, INFO, WARNING, ERROR, or CRITICAL.", ephemeral=True)
+        return
+    try:
+        global DISCORD_LOG_LEVEL, DISCORD_LOG_HANDLER
+        DISCORD_LOG_LEVEL = l
+        if DISCORD_LOG_HANDLER is not None:
+            DISCORD_LOG_HANDLER.setLevel(getattr(logging, l))
+        await interaction.response.send_message(f"Discord log-forwarding level set to {l}", ephemeral=True)
+        logging.info(f"Discord log-forwarding level changed to {l} by user id={interaction.user.id}")
+    except Exception:
+        logging.exception("Failed to set log level via /set_log_level")
+        await interaction.response.send_message("Failed to set log level. See logs.", ephemeral=True)
+
+    async def _sender(self):
+        """Background coroutine running on bot loop that sends queued logs to the channel."""
+        # resolve the channel id
+        try:
+            if not DISCORD_LOG_CHANNEL_ID:
+                return
+            channel_id = int(DISCORD_LOG_CHANNEL_ID)
+        except Exception:
+            logging.error("DISCORD_LOG_CHANNEL_ID is invalid; DiscordLogHandler will not start")
+            return
+
+        # Attempt to get channel object
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except Exception:
+                logging.exception(f"DiscordLogHandler failed to fetch channel {DISCORD_LOG_CHANNEL_ID}")
+                return
+
+        # repeatedly drain queue and send messages
+        while True:
+            try:
+                levelno, msg = await self.queue.get()
+                # Use embed colors per level for readability
+                level_name = logging.getLevelName(levelno)
+                # Map log levels to Discord embed colors
+                color_map = {
+                    logging.DEBUG: 0x99AAB5,    # grey
+                    logging.INFO: 0x57F287,     # green
+                    logging.WARNING: 0xFAA61A,  # orange
+                    logging.ERROR: 0xED4245,    # red
+                    logging.CRITICAL: 0x732FCE  # purple
+                }
+                color = color_map.get(levelno, 0x5865F2)
+
+                # Discord embed description limit is 4096; keep chunks smaller to be safe
+                max_desc = 3800
+                if len(msg) <= max_desc:
+                    embed = discord.Embed(title=f"[{level_name}]", description=msg, color=color, timestamp=datetime.now(timezone.utc))
+                    embed.set_footer(text="lms-scraper logs")
+                    try:
+                        await channel.send(embed=embed)
+                    except Exception:
+                        logging.exception("Failed to send embed log message to Discord channel")
+                else:
+                    # Split into multiple embeds
+                    for i in range(0, len(msg), max_desc):
+                        chunk = msg[i:i+max_desc]
+                        embed = discord.Embed(title=f"[{level_name}] (part {i//max_desc + 1})", description=chunk, color=color, timestamp=datetime.now(timezone.utc))
+                        embed.set_footer(text="lms-scraper logs")
+                        try:
+                            await channel.send(embed=embed)
+                        except Exception:
+                            logging.exception("Failed to send log embed chunk to Discord channel")
+                # small sleep to avoid hitting rate limits when many logs appear
+                await asyncio.sleep(0.25)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logging.exception("Unexpected error in DiscordLogHandler sender loop")
+                await asyncio.sleep(5)
+
+
+def setup_discord_log_handler():
+    if not DISCORD_LOG_CHANNEL_ID:
+        logging.info("DISCORD_LOG_CHANNEL_ID not set; Discord log forwarding disabled")
+        return
+    try:
+        global DISCORD_LOG_HANDLER
+        level = getattr(logging, DISCORD_LOG_LEVEL, logging.WARNING)
+        handler = DiscordLogHandler(bot, level=level)
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        handler.setFormatter(fmt)
+        logging.getLogger().addHandler(handler)
+        DISCORD_LOG_HANDLER = handler
+        logging.info(f"DiscordLogHandler installed for channel {DISCORD_LOG_CHANNEL_ID} at level {DISCORD_LOG_LEVEL}")
+    except Exception:
+        logging.exception("Failed to install DiscordLogHandler")
 
 
 def is_valid_course_url(url: str) -> bool:
@@ -198,7 +311,6 @@ def is_valid_course_url(url: str) -> bool:
     m = re.search(r"^https?://", url)
     if not m:
         return False
-    # require id= followed by digits somewhere
     if not re.search(r"[?&]id=\d+", url):
         return False
     return True
@@ -231,12 +343,17 @@ def user_is_authorized(user: discord.abc.User, guild: discord.Guild | None) -> b
 async def on_ready():
     global COOKIES_MISSING
     try:
-        # register (sync) app commands so they appear in guilds
         await bot.tree.sync()
         logging.info(f"Discord admin bot ready as {bot.user} and commands synced")
     except Exception:
         logging.exception("Failed to sync app commands")
-    # If course_urls.json was missing at startup, notify whitelisted users and role holders via DM
+
+    # Setup discord log handler now that bot.loop is available
+    try:
+        setup_discord_log_handler()
+    except Exception:
+        logging.exception("Failed to setup Discord log handler in on_ready")
+
     if MISSING_COURSE_URLS:
         logging.warning("course_urls.json not found — notifying admins/whitelist via DM")
         notified_ids = set()
@@ -260,7 +377,7 @@ async def on_ready():
             except Exception:
                 logging.exception(f"Failed to DM whitelisted user {user_id}")
 
-        # Notify members who have the admin role in each guild
+        # Notify members who have the admin role
         for guild in bot.guilds:
             try:
                 role = discord.utils.get(guild.roles, name=ADMIN_ROLE_NAME)
@@ -306,7 +423,7 @@ async def on_ready():
                     )
             except Exception:
                 logging.exception("Failed to post missing-course notification to notify channel")
-    # If cookies.json was missing at startup, notify whitelisted users and role holders via DM
+
     if COOKIES_MISSING:
         logging.warning("cookies.json not found — notifying admins/whitelist via DM")
         notified_ids = set()
@@ -349,7 +466,7 @@ async def on_ready():
             except Exception:
                 logging.exception(f"Failed to notify admins in guild {guild.id} about cookies")
 
-    # If cookies.json exists, validate its shape and optionally perform a live validation.
+    # Validate cookies.json
     try:
         if os.path.exists('cookies.json'):
             try:
@@ -405,7 +522,6 @@ async def on_ready():
                     except Exception:
                         logging.exception(f"Failed to notify admins in guild {guild.id} after malformed cookie deletion")
             else:
-                # shape looks OK — accept cookie.json based on structure only (no live HTTP validation)
                 COOKIES_MISSING = False
                 logging.info("cookies.json present and has required shape.")
     except Exception:
@@ -615,11 +731,9 @@ async def set_cookie(interaction: discord.Interaction, cookie_value: str):
         return
     global COOKIES_MISSING, cookies
     try:
-        # Attempt to write the cookie (write_cookies enforces JSON object)
         try:
             write_cookies(cookie_value)
         except ValueError as ve:
-            # Inform the user that full JSON object is required
             try:
                 await interaction.response.send_message(f"Invalid cookie format: {ve}", ephemeral=True)
             except discord.NotFound:
@@ -629,7 +743,7 @@ async def set_cookie(interaction: discord.Interaction, cookie_value: str):
                     logging.exception("Failed to DM user after ValueError in set_cookie")
             return
 
-        # Reload cookies into memory so scraper uses them immediately
+        # Reload cookies into memory
         try:
             new_cookies = read_cookies()
             cookies = new_cookies
@@ -657,51 +771,6 @@ async def set_cookie(interaction: discord.Interaction, cookie_value: str):
                 logging.exception("Also failed to DM user after set_cookie failure")
 
 
-@bot.tree.command(name="preview_notification", description="Send a sample notification embed to the configured notify channel")
-async def preview_notification(interaction: discord.Interaction):
-    """Authorized users can run this to preview the embed in the notify channel."""
-    try:
-        guild_id = interaction.guild.id if interaction.guild else 'DM'
-        logging.info(f"/preview_notification requested by {interaction.user} (id={interaction.user.id}) in guild={guild_id}")
-    except Exception:
-        pass
-    if not user_is_authorized(interaction.user, interaction.guild):
-        await interaction.response.send_message("You are not authorized to use this command.", ephemeral=True)
-        return
-
-    if not DISCORD_NOTIFY_CHANNEL_ID:
-        await interaction.response.send_message("DISCORD_NOTIFY_CHANNEL_ID is not configured on the server.", ephemeral=True)
-        return
-
-    try:
-        channel_id = int(DISCORD_NOTIFY_CHANNEL_ID)
-    except Exception:
-        await interaction.response.send_message("DISCORD_NOTIFY_CHANNEL_ID is invalid.", ephemeral=True)
-        return
-
-    # Build a sample embed similar to the real notification
-    sample_title = "Week 3 — Lecture: Binary Trees"
-    sample_course = "Intro to Algorithms"
-    sample_section = "Week 3"
-    sample_item = {"title": "Binary Trees — Lecture Notes", "url": "https://moodle.example/course/mod/resource/view.php?id=123"}
-
-    embed = discord.Embed(title=sample_item["title"], description=f"[Open resource]({sample_item['url']})", color=0x5865F2, timestamp=datetime.now(timezone.utc))
-    embed.url = sample_item["url"]
-    embed.add_field(name="Course", value=sample_course, inline=True)
-    embed.add_field(name="Section", value=sample_section, inline=True)
-    embed.add_field(name="Type", value="Resource", inline=True)
-    embed.set_footer(text="lms-scraper")
-
-    await interaction.response.defer(ephemeral=True)
-    try:
-        channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-        await channel.send(content="@here 📢 Preview: New course update", embed=embed)
-        await interaction.followup.send(f"Preview sent to <#{channel_id}>.", ephemeral=True)
-    except Exception as exc:
-        logging.exception(f"Failed to send preview notification: {exc}")
-        await interaction.followup.send(f"Failed to send preview: {exc}", ephemeral=True)
-
-
 def start_discord_bot():
     if not DISCORD_BOT_TOKEN:
         logging.info("DISCORD_BOT_TOKEN not set; Discord admin bot will not start.")
@@ -713,7 +782,6 @@ def start_discord_bot():
             logging.exception(f"Discord bot stopped: {e}")
     thread = threading.Thread(target=_run, name="discord-bot-thread", daemon=True)
     thread.start()
-# ------------------------------------------------------------------------------------
 
 def classify(title, desc):
     text = f"{title} {desc}".lower()
@@ -776,12 +844,10 @@ def send_discord_notification(course_title, section, item):
     embed.add_field(name="Type", value=("Notice" if is_notice else ("Resource" if is_resource else "Other")), inline=True)
     embed.set_footer(text="lms-scraper")
 
-    # If no notify channel configured or bot not running, log and skip
     if not DISCORD_NOTIFY_CHANNEL_ID:
         logging.warning("DISCORD_NOTIFY_CHANNEL_ID not set; skipping bot-based notification")
         return
 
-    # Try to send the embed on the bot event loop
     try:
         channel_id = int(DISCORD_NOTIFY_CHANNEL_ID)
     except Exception:
@@ -811,7 +877,6 @@ def send_discord_notification(course_title, section, item):
         logging.exception("Failed to schedule embed send on bot loop")
 
 def scrape_course(url):
-    # Read cookies fresh for each request so /set_cookie takes effect immediately
     req_cookies = read_cookies()
     response = requests.get(url, cookies=req_cookies, headers=headers, verify=False)
     soup = BeautifulSoup(response.text, "html.parser")
@@ -836,7 +901,6 @@ def scrape_course(url):
 
     return title, course_data
 
-# Start the admin Discord bot so commands are available while the scraper runs
 start_discord_bot()
 
 while True:

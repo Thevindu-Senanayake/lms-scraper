@@ -28,8 +28,9 @@ jobs:
           flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
           flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
-      - name: "Check if secrets are loaded"
+      - name: "Check required secrets and repo variables"
         run: |
+          # Keep checking deployment secrets (droplet and ssh key)
           if [ -z "${{ secrets.DROPLET_IP }}" ]; then
             echo "DROPLET_IP secret is NOT set!"
           else
@@ -45,6 +46,16 @@ jobs:
           else
             echo "SSH_PASSPHRASE secret is set."
           fi
+          if [ -z "${{ secrets.DISCORD_BOT_TOKEN }}" ]; then
+            echo "DISCORD_BOT_TOKEN repo variable is NOT set!"
+          else
+            echo "DISCORD_BOT_TOKEN repo variable is set."
+          fi
+          if [ -z "${{ vars.DISCORD_NOTIFY_CHANNEL_ID }}" ]; then
+            echo "DISCORD_NOTIFY_CHANNEL_ID repo variable is NOT set!"
+          else
+            echo "DISCORD_NOTIFY_CHANNEL_ID repo variable is set."
+          fi
       - name: Deploy to server
         uses: appleboy/ssh-action@master
         with:
@@ -56,6 +67,16 @@ jobs:
             cd /root/lms-discord-bot
 
             git pull origin main
+
+            cat > /root/lms-discord-bot/.env <<'EOF'
+              DISCORD_BOT_TOKEN=${{ secrets.DISCORD_BOT_TOKEN }}
+              DISCORD_NOTIFY_CHANNEL_ID=${{ vars.DISCORD_NOTIFY_CHANNEL_ID }}
+              DISCORD_LOG_CHANNEL_ID=${{ vars.DISCORD_LOG_CHANNEL_ID }}
+              DISCORD_LOG_LEVEL=${{ vars.DISCORD_LOG_LEVEL }}
+              DISCORD_ADMIN_ROLE=${{ vars.DISCORD_ADMIN_ROLE }}
+              DISCORD_WHITELISTED_IDS=${{ vars.DISCORD_WHITELISTED_IDS }}
+            EOF
+            chmod 600 /root/lms-discord-bot/.env || true
 
             python3 -m venv venv
 
